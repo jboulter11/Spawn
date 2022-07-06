@@ -35,7 +35,7 @@ public final class Spawn {
     private let process = "/bin/sh"
     private var outputPipe: [Int32] = [-1, -1]
 
-    public init(args: [String], output: OutputClosure? = nil) throws {
+    public init(args: [String], envs: [String], output: OutputClosure? = nil) throws {
         (self.args, self.output)  = (args, output)
 
         if pipe(&outputPipe) < 0 {
@@ -48,10 +48,14 @@ public final class Spawn {
         posix_spawn_file_actions_addclose(&childFDActions, outputPipe[0])
         posix_spawn_file_actions_addclose(&childFDActions, outputPipe[1])
 
-        let argv: [UnsafeMutablePointer<CChar>?] = args.map{ $0.withCString(strdup) }
-        defer { for case let arg? in argv { free(arg) } }
+        let argv: [UnsafeMutablePointer<CChar>?] = args.map { $0.withCString(strdup) }
+        let cEnvs: [UnsafeMutablePointer<CChar>?] = envs.map { $0.withCString(strdup) }
+        defer {
+            for case let arg? in argv { free(arg) }
+            for case let env? in cEnvs { free(env) }
+        }
 
-        if posix_spawn(&pid, argv[0], &childFDActions, nil, argv + [nil], nil) < 0 {
+        if posix_spawn(&pid, argv[0], &childFDActions, nil, argv + [nil], cEnvs) < 0 {
             throw SpawnError.CouldNotSpawn
         }
         watchStreams()
