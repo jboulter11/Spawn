@@ -4,5 +4,21 @@ import PackageDescription
 
 let package = Package(
     name: "Spawn",
-    targets: [Target(name: "SpawnDemo", dependencies: ["Spawn"])]
+    platforms: [
+        .macOS(.v11)
+    ],
+    products: [
+        .library(name: "Spawn", targets: ["Spawn"])
+    ],
+    dependencies: [
+    ],
+    targets: [
+        .target(name: "Spawn"),
+        .executableTarget(
+            name: "SpawnDemo",
+            dependencies: [
+                "Spawn"
+            ]
+        )
+    ]
 )
