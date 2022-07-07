@@ -1,5 +1,9 @@
 # Spawn
 
+* Forked from aciidb0mb3r's Spawn, but modernized for new SPM versions and tweaked for my needs, and maybe yours too.
+
+* Works with sudo's password prompts coming from child processes, unlike Swift's Process APIs.
+
 * Note: Works on macOS and Linux.
 
 * Spawn runs new processes using `posix_spawn` and reads output (and stderr stream) on a different thread so the calling thread is never blocked.
