@@ -32,51 +32,65 @@ public final class Spawn {
     private var childFDActions = posix_spawn_file_actions_t()
     #endif
 
-    private let process = "/bin/sh"
+    /// The pipe we use to communicate (listen, in this case) with our child process.
     private var outputPipe: [Int32] = [-1, -1]
 
-    public init(args: [String], envs: [String], output: OutputClosure? = nil) throws {
+    public init(
+        args: [String],
+        envs: [String] = [],
+        output: OutputClosure? = nil
+    ) throws {
         (self.args, self.output)  = (args, output)
 
-        if pipe(&outputPipe) < 0 {
+        if pipe(&outputPipe) != 0 {
             throw SpawnError.CouldNotOpenPipe
         }
 
+        // Create a file actions object
         posix_spawn_file_actions_init(&childFDActions)
+
+        // Tie the child's stdout and stderr to our pipe so we can read it
         posix_spawn_file_actions_adddup2(&childFDActions, outputPipe[1], 1)
         posix_spawn_file_actions_adddup2(&childFDActions, outputPipe[1], 2)
-        posix_spawn_file_actions_addclose(&childFDActions, outputPipe[0])
-        posix_spawn_file_actions_addclose(&childFDActions, outputPipe[1])
 
+        // Convert to c-strings to provide to posix_spawn.
         let argv: [UnsafeMutablePointer<CChar>?] = args.map { $0.withCString(strdup) }
         let cEnvs: [UnsafeMutablePointer<CChar>?] = envs.map { $0.withCString(strdup) }
+        // Clean up these c-strings after they're done being used.
         defer {
             for case let arg? in argv { free(arg) }
             for case let env? in cEnvs { free(env) }
         }
 
-        if posix_spawn(&pid, argv[0], &childFDActions, nil, argv + [nil], cEnvs) < 0 {
+        // Actually spawn our new process which runs our command.
+        if posix_spawn(&pid, argv[0], &childFDActions, nil, argv + [nil], cEnvs + [nil]) != 0 {
             throw SpawnError.CouldNotSpawn
         }
+
+        // Clean up the file actions object after we're done with it.
+        posix_spawn_file_actions_destroy(&childFDActions)
+
         watchStreams()
     }
 
-    struct ThreadInfo {
-        let outputPipe: UnsafeMutablePointer<Int32>
+    private struct ThreadInfo {
+        let outputPipe: [Int32]
         let output: OutputClosure?
     }
-    var threadInfo: ThreadInfo!
+    private var threadInfo: ThreadInfo!
 
-    func watchStreams() {
+    private func watchStreams() {
         func callback(x: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer? {
-            let threadInfo = unsafeBitCast(x, to: UnsafeMutablePointer<ThreadInfo>.self).pointee
+            let threadInfo = x.assumingMemoryBound(to: ThreadInfo.self).pointee
             let outputPipe = threadInfo.outputPipe
             close(outputPipe[1])
             let bufferSize: size_t = 1024 * 8
             let dynamicBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
             while true {
                 let amtRead = read(outputPipe[0], dynamicBuffer, bufferSize)
-                if amtRead <= 0 { break }
+                if amtRead <= 0 {
+                    break
+                }
                 let array = Array(UnsafeBufferPointer(start: dynamicBuffer, count: amtRead))
                 let tmp = array  + [UInt8(0)]
                 tmp.withUnsafeBufferPointer { ptr in
@@ -87,17 +101,24 @@ public final class Spawn {
             dynamicBuffer.deallocate()
             return nil
         }
-        threadInfo = ThreadInfo(outputPipe: &outputPipe, output: output)
+
+        threadInfo = ThreadInfo(outputPipe: outputPipe, output:output)
+
+        // Create a new thread for listening to the output as our process runs.
         pthread_create(&tid, nil, callback, &threadInfo)
     }
 
-    deinit {
+    @discardableResult
+    public func waitUntilFinished() -> Int32 {
         var status: Int32 = 0
 
+        // wait for the thread watching the streams to finish
         if let tid = tid {
             pthread_join(tid, nil)
         }
 
+        // wait for spawned process to finish
         waitpid(pid, &status, 0)
+        return status
     }
 }
