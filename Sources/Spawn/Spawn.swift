@@ -5,7 +5,7 @@ import Glibc
 #endif
 
 public enum SpawnError: Error {
-    case CouldNotOpenPipe
+    case CouldNotOpenPty
     case CouldNotSpawn
 }
 
@@ -32,26 +32,50 @@ public final class Spawn {
     private var childFDActions = posix_spawn_file_actions_t()
     #endif
 
-    /// The pipe we use to communicate (listen, in this case) with our child process.
-    private var outputPipe: [Int32] = [-1, -1]
+    /// The pty (like a pipe but fakes being a terminal) we use to communicate (listen, in this case) with our child process.
+    private var ptyFDs: [Int32] = [-1, -1]
+    private var writeRawBytesToStdErr: Bool
 
     public init(
         args: [String],
         envs: [String] = [],
+        writeRawBytesToStdErr: Bool = false,
         output: OutputClosure? = nil
     ) throws {
         (self.args, self.output)  = (args, output)
 
-        if pipe(&outputPipe) != 0 {
-            throw SpawnError.CouldNotOpenPipe
+        self.writeRawBytesToStdErr = writeRawBytesToStdErr
+
+        let ptyFD = posix_openpt(O_RDWR)
+        if ptyFD < 0 {
+            throw SpawnError.CouldNotOpenPty
         }
+        // Grant permissions and unlock our pty
+        let grantRet = grantpt(ptyFD)
+        if grantRet < 0 {
+            throw SpawnError.CouldNotOpenPty
+        }
+        let unlockRet = unlockpt(ptyFD)
+        if unlockRet < 0 {
+            throw SpawnError.CouldNotOpenPty
+        }
+
+        // Get the file the file descriptor points to
+        guard let childPtyName = ptsname(ptyFD) else {
+            throw SpawnError.CouldNotOpenPty
+        }
+        // Create an FD for the child
+        let childPtyFD = open(childPtyName, O_RDWR)
+
+        // Save them in pipe format for use later
+        ptyFDs = [ptyFD, childPtyFD]
 
         // Create a file actions object
         posix_spawn_file_actions_init(&childFDActions)
 
-        // Tie the child's stdout and stderr to our pipe so we can read it
-        posix_spawn_file_actions_adddup2(&childFDActions, outputPipe[1], 1)
-        posix_spawn_file_actions_adddup2(&childFDActions, outputPipe[1], 2)
+        // Tie the child's stdout and stderr to our pty file descriptor so we can read it
+        posix_spawn_file_actions_adddup2(&childFDActions, childPtyFD, 1)
+        posix_spawn_file_actions_adddup2(&childFDActions, childPtyFD, 2)
 
         // Convert to c-strings to provide to posix_spawn.
         let argv: [UnsafeMutablePointer<CChar>?] = args.map { $0.withCString(strdup) }
@@ -74,35 +98,51 @@ public final class Spawn {
     }
 
     private struct ThreadInfo {
-        let outputPipe: [Int32]
+        let ptyFDs: [Int32]
         let output: OutputClosure?
+        let writeRawBytesToStdErr: Bool
     }
     private var threadInfo: ThreadInfo!
 
     private func watchStreams() {
         func callback(x: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer? {
             let threadInfo = x.assumingMemoryBound(to: ThreadInfo.self).pointee
-            let outputPipe = threadInfo.outputPipe
-            close(outputPipe[1])
+            let ptyFDs = threadInfo.ptyFDs
+            // Close our child end of the pty, since we don't need it.
+            close(ptyFDs[1])
+
             let bufferSize: size_t = 1024 * 8
             let dynamicBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+
+            // Don't buffer output to stderr
+            // Flush immediately after writing every time
+            if threadInfo.writeRawBytesToStdErr {
+                setbuf(__stderrp, nil)
+            }
+
             while true {
-                let amtRead = read(outputPipe[0], dynamicBuffer, bufferSize)
+                let amtRead = read(ptyFDs[0], dynamicBuffer, bufferSize)
                 if amtRead <= 0 {
                     break
                 }
+
+                if threadInfo.writeRawBytesToStdErr {
+                    write(2, dynamicBuffer, amtRead)
+                }
+
+                // Create a swift string and pass to output closure for capturing output
                 let array = Array(UnsafeBufferPointer(start: dynamicBuffer, count: amtRead))
-                let tmp = array  + [UInt8(0)]
+                let tmp = array  + [UInt8(0)] // null char at end of string so it's properly interpreted by swift as a c str
                 tmp.withUnsafeBufferPointer { ptr in
-                    let str = String(cString: unsafeBitCast(ptr.baseAddress, to: UnsafePointer<CChar>.self))
-                    threadInfo.output?(str)
+                  let str = String(cString: unsafeBitCast(ptr.baseAddress, to: UnsafePointer<CChar>.self))
+                  threadInfo.output?(str)
                 }
             }
             dynamicBuffer.deallocate()
             return nil
         }
 
-        threadInfo = ThreadInfo(outputPipe: outputPipe, output:output)
+        threadInfo = ThreadInfo(ptyFDs: ptyFDs, output:output, writeRawBytesToStdErr: writeRawBytesToStdErr)
 
         // Create a new thread for listening to the output as our process runs.
         pthread_create(&tid, nil, callback, &threadInfo)
